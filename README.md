@@ -1,6 +1,9 @@
-# Suricata Eve Kafka Output Plugin for Suricata 6.0.x
+# Suricata Eve Kafka Output Plugin for Suricata 7.0.x
 
-This plugin provides a Suricata Eve output for Kafka. Base on suricata-redis-output: https://github.com/jasonish/suricata-redis-output/tree/6.0
+This plugin provides a Suricata Eve output for Kafka. Base on suricata-redis-output: https://github.com/jasonish/suricata-redis-output ,https://github.com/Center-Sun/suricata-kafka-output
+
+
+
 
 ## Building
 

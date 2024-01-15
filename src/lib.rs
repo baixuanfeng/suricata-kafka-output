@@ -29,22 +29,25 @@ use rdkafka::{ClientConfig};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use std::fmt::Error;
 use std::os::raw::{c_char, c_int, c_void};
-use std::sync::mpsc::TrySendError;
+//use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{SyncSender, TrySendError};
+use std::thread::{self, JoinHandle};
+//use std::sync::Arc;
 use suricata::conf::ConfNode;
 use suricata::{SCLogError, SCLogNotice};
 
-
+// Default configuration values. Kafka requires a broker list and topic, so
 const DEFAULT_BUFFER_SIZE: &str = "65535";
 const DEFAULT_CLIENT_ID: &str = "rdkafka";
+const DEFAULT_
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone)]     
 struct ProducerConfig {
     brokers: String,
     topic: String,
     client_id: String,
     buffer: usize,
 }
-
 
 impl ProducerConfig {
     fn new(conf: &ConfNode) -> Result<Self,Error> {
@@ -142,15 +145,62 @@ impl KafkaProducer {
             SCLogNotice!("Producer finished: count={}", self.count,);
     }
 }
-struct Context {
-    tx: std::sync::mpsc::SyncSender<String>,
+
+struct Context { 
+    tx: SyncSender<String>,
+    th: JoinHandle<()>,
+    thread: Option<ThreadContext>,
     count: usize,
     dropped: usize,
 }
 
-unsafe extern "C" fn output_open(conf: *const c_void, init_data: *mut *mut c_void) -> c_int {
+struct ThreadContext {
+    thread_id: usize,
+    tx: SyncSender<String>,
+    count: usize,
+    dropped: usize,
+}
+
+impl ThreadContext {
+    fn new(thread_id: usize, tx: SyncSender<String>) -> Self {
+        Self {
+            thread_id,
+            tx,
+            count: 0,
+            dropped: 0,
+        }
+    }
+
+    fn send(&mut self, buf: &str) {
+        self.count += 1;
+        if let Err(err) = self.tx.try_send(buf.to_string()) {
+            self.dropped += 1;
+            match err {
+                TrySendError::Full(_) => {
+                    SCLogError!("Eve record lost due to full buffer");
+                }
+                TrySendError::Disconnected(_) => {
+                    SCLogError!("Eve record lost due to broken channel{}",err);
+                }
+            }
+        }
+    }
+
+    fn log_exit_stats(&self) {
+        SCLogNotice!(
+            "Kafka output finished: thread={}, count={}, dropped={}",
+            self.thread_id,
+            self.count,
+            self.dropped
+        );
+    }
+}
+
+
+unsafe extern "C" fn output_init(conf: *const c_void, threaded: bool, init_data: *mut *mut c_void) -> c_int {
     // Load configuration.
-    let config = ProducerConfig::new(&ConfNode::wrap(conf)).unwrap();
+    // let config = ProducerConfig::new(&ConfNode::wrap(conf)).unwrap();
+    let config = ConfNode::wrap(conf).get_child("kafka").map(|conf| ProducerConfig::new(&conf)).unwrap().unwrap();
 
     let (tx, rx) = std::sync::mpsc::sync_channel(config.buffer);
 
@@ -171,13 +221,21 @@ unsafe extern "C" fn output_open(conf: *const c_void, init_data: *mut *mut c_voi
         }
     };
 
+    let th = std::thread::spawn(move || {kafka_producer.run()});
+    // kafka_producer.run();
+
     let context = Context {
-        tx,
+        tx: tx.clone(),
+        th, 
+        thread: if threaded {
+            None
+        } else {
+            Some(ThreadContext::new(1, tx))
+        },
         count: 0,
         dropped: 0,
     };
-    std::thread::spawn(move || {kafka_producer.run()});
-    // kafka_producer.run();
+
 
     *init_data = Box::into_raw(Box::new(context)) as *mut _;
     0
@@ -197,34 +255,49 @@ unsafe extern "C" fn output_write(
     buffer: *const c_char,
     buffer_len: c_int,
     init_data: *const c_void,
+    thread_data: *const c_void,
 ) -> c_int {
     let context = &mut *(init_data as *mut Context);
+
+    // If thread_data is null then we're setup for single threaded mode, and use
+    // the default thread context.
+    let thread_context = if thread_data.is_null() {
+        context.thread.as_mut().unwrap()
+    } else {
+        &mut *(thread_data as *mut ThreadContext)
+    };
+
     let buf = if let Ok(buf) = ffi::str_from_c_parts(buffer, buffer_len) {
         buf
     } else {
         return -1;
     };
 
-    context.count += 1;
+    thread_context.send(buf);
+    0
+}
 
-    if let Err(err) = context.tx.try_send(buf.to_string()) {
-        context.dropped += 1;
-        match err {
-            TrySendError::Full(_) => {
-                SCLogError!("Eve record lost due to full buffer");
-            }
-            TrySendError::Disconnected(_) => {
-                SCLogError!("Eve record lost due to broken channel{}",err);
-            }
-        }
-    }
-    00
+unsafe extern "C" fn output_thread_init(
+    init_data: *const c_void,
+    thread_id: std::os::raw::c_int,
+    thread_data: *mut *mut c_void,
+) -> c_int {
+    let context = &mut *(init_data as *mut Context);
+    let thread_context = ThreadContext::new(thread_id as usize, context.tx.clone());
+    *thread_data = Box::into_raw(Box::new(thread_context)) as *mut _;
+    0
+}
+
+unsafe extern "C" fn output_thread_deinit(_init_data: *const c_void, thread_data: *mut c_void) {
+    let thread_context = Box::from_raw(thread_data as *mut ThreadContext);
+    thread_context.log_exit_stats();
+    std::mem::drop(thread_context);
 }
 
 unsafe extern "C" fn init_plugin() {
     let file_type =
-        ffi::SCPluginFileType::new("kafka", output_open, output_close, output_write);
-    ffi::SCPluginRegisterFileType(file_type);
+        ffi::SCEveFileType::new("kafka", output_init, output_close, output_write, output_thread_init, output_thread_deinit);
+    ffi::SCRegisterEveFileType(file_type);
 }
 
 #[no_mangle]
@@ -233,5 +306,5 @@ extern "C" fn SCPluginRegister() -> *const ffi::SCPlugin {
     suricata::plugin::init();
 
     // Register our plugin.
-    ffi::SCPlugin::new("Kafka Eve Filetype", "GPL-2.0", "1z3r0", init_plugin)
+    ffi::SCPlugin::new("Kafka Eve Filetype", "GPL-2.0", "sven", init_plugin)
 }

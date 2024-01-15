@@ -55,45 +55,60 @@ impl SCPlugin {
     }
 }
 
-pub type OpenFn = unsafe extern "C" fn(conf: *const c_void, init_data: *mut *mut c_void) -> c_int;
-pub type CloseFn = unsafe extern "C" fn(init_data: *const c_void);
+pub type InitFn =
+    unsafe extern "C" fn(conf: *const c_void, threaded: bool, init_data: *mut *mut c_void) -> c_int;
+pub type DeinitFn = unsafe extern "C" fn(init_data: *const c_void);
 pub type WriteFn = unsafe extern "C" fn(
     buffer: *const c_char,
     buffer_len: c_int,
     init_data: *const c_void,
+    thread_data: *const c_void,
 ) -> c_int;
+pub type ThreadInitFn = unsafe extern "C" fn(
+    init_data: *const c_void,
+    thread_id: std::os::raw::c_int,
+    thread_data: *mut *mut c_void,
+) -> c_int;
+pub type ThreadDeinitFn = unsafe extern "C" fn(init_data: *const c_void, thread_data: *mut c_void);
 
 #[repr(C)]
 #[allow(non_snake_case)]
-pub struct SCPluginFileType {
+pub struct SCEveFileType {
     pub name: *const c_char,
-    pub open: OpenFn,
+    pub open: InitFn,
     pub write: WriteFn,
-    pub close: CloseFn,
-
-    // Pad for the TAILQ datastructure. This will not be required in 7.0.
-    pad0: usize,
-    pad1: usize,
+    pub close: DeinitFn,
+    pub thread_init: ThreadInitFn,
+    pub thread_deinit: ThreadDeinitFn,
+    pad: [usize; 2],
 }
 
-impl SCPluginFileType {
-    pub fn new(name: &str, open: OpenFn, close: CloseFn, write: WriteFn) -> *const Self {
+impl SCEveFileType {
+    pub fn new(
+        name: &str,
+        open: InitFn,
+        close: DeinitFn,
+        write: WriteFn,
+        thread_init: ThreadInitFn,
+        thread_deinit: ThreadDeinitFn,
+    ) -> *const Self {
         // Convert the name to C and forget.
         let name = CString::new(name).unwrap().into_raw();
-        let file_type = SCPluginFileType {
+        let file_type = SCEveFileType {
             name,
             open,
             close,
             write,
-            pad0: 0,
-            pad1: 0,
+            thread_init,
+            thread_deinit,
+            pad: [0, 0],
         };
         Box::into_raw(Box::new(file_type))
     }
 }
 
 extern "C" {
-    pub fn SCPluginRegisterFileType(filetype: *const SCPluginFileType) -> bool;
+    pub fn SCRegisterEveFileType(filetype: *const SCEveFileType) -> bool;
 }
 
 // Convert a C string with a provided length to a Rust &str.
